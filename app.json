@@ -1,0 +1,33 @@
+{
+  "name": "VelocityBots API",
+  "description": "Fast, Telegram-compatible YouTube audio API with progressive playback.",
+  "keywords": [
+    "fastapi",
+    "telegram",
+    "music-bot",
+    "youtube",
+    "downloader"
+  ],
+  "env": {
+    "API_KEY": {
+      "description": "Private API key used by your Telegram music bot.",
+      "required": true
+    },
+    "PUBLIC_BASE_URL": {
+      "description": "Public Heroku URL, for example https://your-app.herokuapp.com",
+      "required": true
+    },
+    "COOKIE_URL": {
+      "description": "Optional private HTTPS URL returning a Netscape cookies.txt file.",
+      "required": false
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ]
+}
