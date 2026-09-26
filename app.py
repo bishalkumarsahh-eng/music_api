@@ -958,6 +958,7 @@ def download_audio_sync(url: str) -> Dict[str, Any]:
         "nocheckcertificate": True,
         "noprogress": True,
         "quiet": True,
+        "extractor_args": {"youtube": {"fetch_pot": ["always"]}},
         "no_warnings": True,
         "updatetime": False,
         "clean_infojson": False,
