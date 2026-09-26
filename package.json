@@ -5,6 +5,6 @@
     "node": ">=22 <23"
   },
   "scripts": {
-    "postinstall": "if [ ! -d .bgutil-provider ]; then git clone --depth 1 --branch 2.0.0 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git .bgutil-provider; fi && cd .bgutil-provider/server && npm ci && npx tsc"
+    "postinstall": "if [ ! -d .bgutil-provider ]; then git clone --depth 1 --branch 2.0.0 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git .bgutil-provider; fi && cd .bgutil-provider/server && npm ci --include=dev --no-audit --no-fund && npx tsc"
   }
 }
