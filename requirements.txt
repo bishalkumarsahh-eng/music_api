@@ -5,3 +5,4 @@ yt-dlp[default]
 yt-dlp-ejs
 ytmusicapi
 python-dotenv
+bgutil-ytdlp-pot-provider==2.0.0

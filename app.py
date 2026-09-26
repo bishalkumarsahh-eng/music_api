@@ -70,6 +70,16 @@ YOUTUBE_PLAYER_CLIENTS = os.getenv(
     "default"
 ).strip()
 
+YOUTUBE_POT_PROVIDER_URL = os.getenv(
+    "YOUTUBE_POT_PROVIDER_URL",
+    "http://127.0.0.1:4416"
+).strip()
+
+YOUTUBE_USER_AGENT = os.getenv(
+    "YOUTUBE_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+).strip()
+
 COOKIES_FILE = "cookies.txt"
 USE_COOKIES = os.getenv(
     "USE_COOKIES",
@@ -825,20 +835,28 @@ def get_base_ydl_opts() -> Dict[str, Any]:
     if USE_COOKIES and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
         opts["cookiefile"] = COOKIES_FILE
         logger.info("yt-dlp will use cookies.txt for YouTube authentication")
-    elif os.path.exists(COOKIES_FILE):
-        logger.info(f"Cookies file found but disabled (USE_COOKIES={USE_COOKIES})")
+
+    # Keep the browser identity stable when cookies are supplied. YouTube can
+    # bind sessions to request metadata such as the user agent.
+    opts["http_headers"] = {
+        "User-Agent": YOUTUBE_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
     return opts
 
 
 def apply_youtube_extractor_args(opts: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply optional YouTube client overrides without overriding yt-dlp's
-    normal client selection when YOUTUBE_PLAYER_CLIENTS=default/empty."""
-    clients = [
-        c.strip() for c in YOUTUBE_PLAYER_CLIENTS.split(",") if c.strip()
-    ]
+    """Configure YouTube clients and the local BgUtils PO-token provider."""
+    youtube_args = opts.setdefault("extractor_args", {}).setdefault("youtube", {})
+
+    clients = [c.strip() for c in YOUTUBE_PLAYER_CLIENTS.split(",") if c.strip()]
     if clients and [c.lower() for c in clients] != ["default"]:
-        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+        youtube_args["player_client"] = clients
+
+    if YOUTUBE_POT_PROVIDER_URL:
+        opts["extractor_args"].setdefault("youtubepot-bgutilhttp", {})["base_url"] = YOUTUBE_POT_PROVIDER_URL
+
     return opts
 
 
@@ -1382,6 +1400,58 @@ async def root():
 
 
 # =========================================================
+# YOUTUBE AUTHENTICATION TEST
+# =========================================================
+
+@app.get("/youtube-test")
+async def youtube_test(
+    url: str = Query(..., description="YouTube URL or 11-character video ID"),
+    _: bool = Depends(require_api_key),
+):
+    """Probe YouTube extraction without downloading a file.
+
+    This endpoint is intentionally small and never returns cookies or tokens.
+    It distinguishes a cookie/session rejection from a format/PO-token error.
+    """
+    video_id = extract_video_id(url)
+    target = f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+    opts = get_base_ydl_opts()
+    opts["skip_download"] = True
+    opts["noplaylist"] = True
+    opts["quiet"] = True
+    opts["no_warnings"] = False
+    apply_youtube_extractor_args(opts)
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+        return {
+            "status": "ok",
+            "video_id": info.get("id"),
+            "title": info.get("title"),
+            "formats": len(info.get("formats") or []),
+            "cookies_loaded": bool(opts.get("cookiefile")),
+            "pot_provider": YOUTUBE_POT_PROVIDER_URL or None,
+        }
+    except yt_dlp.utils.DownloadError as e:
+        message = str(e)
+        lower = message.lower()
+        if "sign in to confirm" in lower or "not a bot" in lower or "login_required" in lower:
+            detail = "YouTube rejected the current session. Check cookies and the PO-token provider."
+        elif "po token" in lower or "proof-of-origin" in lower:
+            detail = "YouTube requires a PO token; check the BgUtils provider in the Heroku logs."
+        else:
+            detail = message
+        return JSONResponse(status_code=502, content={
+            "status": "youtube_error",
+            "detail": detail,
+            "cookies_loaded": bool(opts.get("cookiefile")),
+            "pot_provider": YOUTUBE_POT_PROVIDER_URL or None,
+            "video_id": video_id,
+        })
+
+
+# =========================================================
 # HEALTH
 # =========================================================
 
@@ -1402,7 +1472,9 @@ async def health_check():
         "cache_expiry_hours":
             CACHE_EXPIRE_HOURS,
         "youtube_cookies_enabled": USE_COOKIES and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0,
-        "youtube_client_override": YOUTUBE_PLAYER_CLIENTS if YOUTUBE_PLAYER_CLIENTS.lower() != "default" else "yt-dlp-default"
+        "youtube_client_override": YOUTUBE_PLAYER_CLIENTS if YOUTUBE_PLAYER_CLIENTS.lower() != "default" else "yt-dlp-default",
+        "youtube_pot_provider": YOUTUBE_POT_PROVIDER_URL or None,
+        "youtube_user_agent_configured": bool(YOUTUBE_USER_AGENT),
     }
 
 
