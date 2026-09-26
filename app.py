@@ -1,910 +1,1929 @@
-"""VelocityBots - fast YouTube audio/video API.
-
-The API is intentionally small and predictable:
-  /download       cache-first audio metadata
-  /stream         cache-first direct MP3 response
-  /video          video metadata
-  /video-stream   direct MP4 response
-  /search         YouTube Music search
-
-Set API_KEY before exposing this service publicly.  FFmpeg is required for
-audio conversion and video merging.
-"""
-
-from __future__ import annotations
-
-import asyncio
-import logging
 import os
+# === SPEED OPTIMIZATION V2 ===
+# Defaults are tuned for Heroku: moderate concurrency and low retry overhead.
 import re
-import sqlite3
-import subprocess
-import sys
 import time
+import asyncio
+import sqlite3
+import logging
 import urllib.request
+import subprocess
+import base64
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Any, Dict, Optional
-from urllib.parse import quote, urlparse
 
-import yt_dlp
-from dotenv import load_dotenv
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+
+from dotenv import load_dotenv
+import httpx
+import yt_dlp
 from ytmusicapi import YTMusic
 
 
+# =========================================================
+# LOAD ENVIRONMENT VARIABLES
+# =========================================================
+
 load_dotenv()
 
-SERVICE_NAME = "VelocityBots"
-VERSION = "1.0.0"
-PORT = int(os.getenv("PORT", "8000"))
-API_KEY = os.getenv("API_KEY", "").strip()
-DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "downloads")).resolve()
-DB_FILE = Path(os.getenv("DB_FILE", "velocitybots.db")).resolve()
-COOKIE_FILE = Path(os.getenv("COOKIE_FILE", "cookies.txt")).resolve()
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+DOWNLOAD_DIR = os.getenv(
+    "DOWNLOAD_DIR",
+    "downloads"
+)
+
+CACHE_EXPIRE_HOURS = float(
+    os.getenv(
+        "CACHE_EXPIRE_HOURS",
+        "0"
+    )
+)
+
+MAX_VIDEO_QUALITY = os.getenv(
+    "MAX_VIDEO_QUALITY",
+    "720"
+)
+
+PORT = int(
+    os.getenv(
+        "PORT",
+        "8000"
+    )
+)
+
 COOKIE_URL = os.getenv("COOKIE_URL", "").strip()
-CACHE_EXPIRE_HOURS = float(os.getenv("CACHE_EXPIRE_HOURS", "0"))
-MAX_VIDEO_QUALITY = int(os.getenv("MAX_VIDEO_QUALITY", "720"))
-CONCURRENT_FRAGMENT_DOWNLOADS = int(
-    os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "30")
-)
-HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", "10485760"))
-SOCKET_TIMEOUT = int(os.getenv("SOCKET_TIMEOUT", "20"))
-RETRIES = int(os.getenv("RETRIES", "3"))
-FRAGMENT_RETRIES = int(os.getenv("FRAGMENT_RETRIES", "3"))
+# Backward/alternate names supported so deployment changes do not silently
+# disable cookie authentication.
+COOKIE_FILE_URL = os.getenv("COOKIE_FILE_URL", "").strip()
+COOKIE_BASE64 = os.getenv("COOKIE_BASE64", "").strip()
 
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# YouTube player clients. Avoid the deprecated/problematic tv_downgraded
+# client that can cause "The page needs to be reloaded" errors.
+YOUTUBE_PLAYER_CLIENTS = os.getenv(
+    "YOUTUBE_PLAYER_CLIENTS",
+    "default"
+).strip()
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("velocitybots")
+COOKIES_FILE = "cookies.txt"
+USE_COOKIES = os.getenv(
+    "USE_COOKIES",
+    "false"
+).strip().lower() in {"1", "true", "yes", "on"}
+DEBUG_ERRORS = os.getenv(
+    "DEBUG_ERRORS",
+    "false"
+).strip().lower() in {"1", "true", "yes", "on"}
 
+DB_FILE = "cache.db"
 
-def init_db() -> None:
-    with sqlite3.connect(DB_FILE, timeout=15) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS downloads (
-                video_id TEXT NOT NULL,
-                media_type TEXT NOT NULL,
-                title TEXT,
-                file_name TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                file_size INTEGER NOT NULL DEFAULT 0,
-                duration INTEGER NOT NULL DEFAULT 0,
-                thumbnail TEXT,
-                uploader TEXT,
-                created_at REAL NOT NULL,
-                PRIMARY KEY (video_id, media_type)
-            )
-            """
-        )
-        connection.commit()
+# =========================================================
+# API KEY AUTHENTICATION
+# =========================================================
+# Set API_KEY in Heroku Config Vars. Keep this value secret.
+# Client requests should send: X-API-Key: <your-key>
+# Authorization: Bearer <your-key> is also accepted.
+# For compatibility, ?api_key=<your-key> is also accepted.
 
-
-def cleanup_expired_cache() -> None:
-    if CACHE_EXPIRE_HOURS <= 0:
-        return
-
-    cutoff = time.time() - (CACHE_EXPIRE_HOURS * 3600)
-    with sqlite3.connect(DB_FILE, timeout=15) as connection:
-        rows = connection.execute(
-            "SELECT file_path FROM downloads WHERE created_at < ?",
-            (cutoff,),
-        ).fetchall()
-        for (file_path,) in rows:
-            try:
-                Path(file_path).unlink(missing_ok=True)
-            except OSError:
-                logger.warning("Could not remove expired file: %s", file_path)
-        connection.execute("DELETE FROM downloads WHERE created_at < ?", (cutoff,))
-        connection.commit()
-
-
-async def cache_worker() -> None:
-    while True:
-        await asyncio.sleep(900)
-        try:
-            await asyncio.to_thread(cleanup_expired_cache)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Cache cleanup failed")
-
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    init_db()
-    if COOKIE_URL:
-        try:
-            urllib.request.urlretrieve(COOKIE_URL, COOKIE_FILE)
-            logger.info("Downloaded configured cookie file")
-        except Exception:
-            logger.exception("Could not download COOKIE_URL")
-
-    worker = asyncio.create_task(cache_worker())
-    yield
-    worker.cancel()
-    try:
-        await worker
-    except asyncio.CancelledError:
-        pass
-
-
-app = FastAPI(
-    title="VelocityBots API",
-    description="Fast, cache-first media downloads for bots and applications.",
-    version=VERSION,
-    lifespan=lifespan,
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        origin.strip()
-        for origin in os.getenv("CORS_ORIGINS", "*").split(",")
-        if origin.strip()
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+API_KEY = os.getenv("API_KEY", "").strip()
 
 
 async def require_api_key(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None),
-    api_key: Optional[str] = Query(
-        default=None,
-        description="Legacy compatibility. Prefer X-API-Key.",
-    ),
-) -> bool:
-    """Accept the two common bot auth headers plus legacy query auth."""
+    api_key: Optional[str] = Query(default=None, description="API key (legacy/query compatibility)")
+):
+    """Protect API endpoints with a server-side API key."""
+
     if not API_KEY:
+        logger.error("API_KEY is not configured on the server.")
         raise HTTPException(
             status_code=503,
-            detail="API_KEY is not configured on the server.",
+            detail="API authentication is not configured on the server."
         )
 
-    supplied = (x_api_key or api_key or "").strip()
-    if not supplied and authorization:
+    # Prefer the HTTP header. Also accept ?api_key=... for compatibility
+    # with existing Music Bot clients.
+    supplied_key = (x_api_key or api_key or "").strip()
+
+    # Also accept Authorization: Bearer <key> for clients that prefer it.
+    if not supplied_key and authorization:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() == "bearer":
-            supplied = token.strip()
+            supplied_key = token.strip()
 
-    if supplied != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+    if not supplied_key or supplied_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key."
+        )
+
     return True
 
 
-def extract_video_id(value: str) -> Optional[str]:
-    value = value.strip()
-    if re.fullmatch(r"[0-9A-Za-z_-]{11}", value):
-        return value
-    match = re.search(
-        r"(?:youtu\.be/|[?&]v=|/shorts/|/embed/|/live/|/v/)"
-        r"([0-9A-Za-z_-]{11})",
-        value,
-    )
-    return match.group(1) if match else None
+# =========================================================
+# DOWNLOAD PERFORMANCE SETTINGS
+# =========================================================
+
+CONCURRENT_FRAGMENT_DOWNLOADS = int(os.getenv("CONCURRENT_FRAGMENT_DOWNLOADS", "15"))
+
+HTTP_CHUNK_SIZE = int(os.getenv("HTTP_CHUNK_SIZE", "10485760"))
+
+SOCKET_TIMEOUT = int(os.getenv("SOCKET_TIMEOUT", "15"))
+
+RETRIES = int(os.getenv("RETRIES", "3"))
+
+FRAGMENT_RETRIES = int(os.getenv("FRAGMENT_RETRIES", "3"))
+
+# Optional low-latency upstream. When configured, /stream proxies the
+# upstream's already-streaming audio response instead of running yt-dlp and
+# FFmpeg locally before sending the first byte.
+REMOTE_API_URL = os.getenv("REMOTE_API_URL", "").strip().rstrip("/")
+# Reuse the local key by default when both API deployments share a key.
+REMOTE_API_KEY = os.getenv("REMOTE_API_KEY", API_KEY).strip()
+REMOTE_CONNECT_TIMEOUT = float(os.getenv("REMOTE_CONNECT_TIMEOUT", "5"))
+REMOTE_READ_TIMEOUT = float(os.getenv("REMOTE_READ_TIMEOUT", "300"))
+REMOTE_CHUNK_SIZE = int(os.getenv("REMOTE_CHUNK_SIZE", "65536"))
 
 
-def normalize_url(value: str) -> str:
-    """Accept a video ID or a YouTube URL, and reject unrelated URLs."""
-    video_id = extract_video_id(value)
-    if video_id and not re.match(r"^https?://", value, re.I):
-        return f"https://www.youtube.com/watch?v={video_id}"
+# =========================================================
+# LOGGING
+# =========================================================
 
-    parsed = urlparse(value)
-    host = parsed.netloc.lower().split(":")[0]
-    allowed_hosts = {
-        "youtube.com",
-        "www.youtube.com",
-        "m.youtube.com",
-        "music.youtube.com",
-        "youtu.be",
-        "www.youtu.be",
-    }
-    if parsed.scheme not in {"http", "https"} or host not in allowed_hosts:
-        raise HTTPException(
-            status_code=422,
-            detail="Only YouTube URLs or 11-character YouTube video IDs are supported.",
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =========================================================
+# DOWNLOAD DIRECTORY
+# =========================================================
+
+os.makedirs(
+    DOWNLOAD_DIR,
+    exist_ok=True
+)
+
+
+# =========================================================
+# DATABASE & CACHE SYSTEM
+# =========================================================
+
+def init_db():
+
+    """Initializes the SQLite database for caching metadata safely."""
+
+    try:
+
+        with sqlite3.connect(
+            DB_FILE,
+            timeout=15.0
+        ) as conn:
+
+            conn.execute(
+                '''
+                CREATE TABLE IF NOT EXISTS downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT,
+                    title TEXT,
+                    file_name TEXT,
+                    file_path TEXT,
+                    file_type TEXT,
+                    file_size INTEGER,
+                    duration INTEGER,
+                    created_time REAL,
+                    thumbnail TEXT,
+                    UNIQUE(video_id, file_type)
+                )
+                '''
+            )
+
+            conn.commit()
+
+        logger.info(
+            "SQLite database initialized."
         )
-    if not extract_video_id(value):
-        raise HTTPException(status_code=422, detail="The YouTube video ID is missing.")
-    return value
+
+    except Exception as e:
+
+        logger.error(
+            f"Database initialization failed: {e}"
+        )
 
 
-def base_ydl_options() -> Dict[str, Any]:
-    options: Dict[str, Any] = {
-        "outtmpl": str(DOWNLOAD_DIR / "%(title).150s_%(id)s.%(ext)s"),
-        "restrictfilenames": True,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noprogress": True,
-        "continuedl": True,
-        "retries": RETRIES,
-        "fragment_retries": FRAGMENT_RETRIES,
-        "socket_timeout": SOCKET_TIMEOUT,
+def get_cached_metadata(
+    video_id: str,
+    file_type: str
+) -> Optional[Dict[str, Any]]:
+
+    """Retrieves cached metadata from SQLite and verifies file existence."""
+
+    try:
+
+        with sqlite3.connect(
+            DB_FILE,
+            timeout=15.0
+        ) as conn:
+
+            conn.row_factory = sqlite3.Row
+
+            cur = conn.cursor()
+
+            cur.execute(
+                """
+                SELECT *
+                FROM downloads
+                WHERE video_id = ?
+                AND file_type = ?
+                """,
+                (
+                    video_id,
+                    file_type
+                )
+            )
+
+            row = cur.fetchone()
+
+            if row:
+
+                if (
+                    os.path.isfile(
+                        row["file_path"]
+                    )
+                    and
+                    os.path.getsize(
+                        row["file_path"]
+                    ) > 0
+                ):
+
+                    return dict(row)
+
+                else:
+
+                    logger.warning(
+                        f"File {row['file_name']} "
+                        "missing from disk. "
+                        "Removing DB entry."
+                    )
+
+                    cur.execute(
+                        """
+                        DELETE FROM downloads
+                        WHERE id = ?
+                        """,
+                        (
+                            row["id"],
+                        )
+                    )
+
+                    conn.commit()
+
+            return None
+
+    except Exception as e:
+
+        logger.error(
+            f"Error accessing cache DB: {e}"
+        )
+
+        return None
+
+
+def save_cached_metadata(
+    data: Dict[str, Any],
+    file_type: str
+):
+
+    """Saves download metadata to SQLite."""
+
+    try:
+
+        with sqlite3.connect(
+            DB_FILE,
+            timeout=15.0
+        ) as conn:
+
+            conn.execute(
+                '''
+                INSERT OR REPLACE INTO downloads
+                (
+                    video_id,
+                    title,
+                    file_name,
+                    file_path,
+                    file_type,
+                    file_size,
+                    duration,
+                    created_time,
+                    thumbnail
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    data["videoId"],
+                    data["title"],
+                    data["filename"],
+                    data["path"],
+                    file_type,
+                    data["filesize"],
+                    data["duration"],
+                    time.time(),
+                    data["thumbnail"]
+                )
+            )
+
+            conn.commit()
+
+    except Exception as e:
+
+        logger.error(
+            f"Error saving to cache DB: {e}"
+        )
+
+
+def find_legacy_cached_file(
+    video_id: str,
+    ext: str
+) -> Optional[str]:
+
+    """Fallback to check un-indexed files downloaded before SQLite was added."""
+
+    if not video_id:
+
+        return None
+
+    suffix = f"_{video_id}.{ext}"
+
+    try:
+
+        with os.scandir(
+            DOWNLOAD_DIR
+        ) as entries:
+
+            for entry in entries:
+
+                if entry.name.endswith(
+                    suffix
+                ):
+
+                    return entry.name
+
+    except Exception as e:
+
+        logger.error(
+            f"Error reading {DOWNLOAD_DIR}: {e}"
+        )
+
+    return None
+
+
+# =========================================================
+# CACHE CLEANUP
+# =========================================================
+
+async def cache_cleanup_task():
+
+    """Background task to delete old files and clean up database."""
+
+    while True:
+
+        try:
+
+            logger.info(
+                "Running advanced cache cleanup..."
+            )
+
+            # CACHE_EXPIRE_HOURS <= 0 means permanent cache.
+            # Never scan/delete cached media in permanent-cache mode.
+            if CACHE_EXPIRE_HOURS <= 0:
+                logger.info("Permanent cache enabled — skipping automatic file deletion.")
+                await asyncio.sleep(3600)
+                continue
+
+            expiry_time = (
+                time.time()
+                -
+                (
+                    CACHE_EXPIRE_HOURS
+                    * 3600
+                )
+            )
+
+            def perform_cleanup():
+
+                deleted_files = 0
+                db_cleaned = 0
+
+                with sqlite3.connect(
+                    DB_FILE,
+                    timeout=15.0
+                ) as conn:
+
+                    conn.row_factory = sqlite3.Row
+
+                    cur = conn.cursor()
+
+                    # -----------------------------------------
+                    # 1. Scan disk for expired files
+                    # -----------------------------------------
+
+                    if os.path.exists(
+                        DOWNLOAD_DIR
+                    ):
+
+                        for entry in os.scandir(
+                            DOWNLOAD_DIR
+                        ):
+
+                            if entry.is_file():
+
+                                file_stat = entry.stat()
+
+                                if (
+                                    file_stat.st_mtime
+                                    <
+                                    expiry_time
+                                ):
+
+                                    try:
+
+                                        os.remove(
+                                            entry.path
+                                        )
+
+                                        deleted_files += 1
+
+                                        cur.execute(
+                                            """
+                                            DELETE FROM downloads
+                                            WHERE file_name = ?
+                                            """,
+                                            (
+                                                entry.name,
+                                            )
+                                        )
+
+                                    except Exception as e:
+
+                                        logger.warning(
+                                            f"Could not delete old "
+                                            f"file {entry.name}: {e}"
+                                        )
+
+                    # -----------------------------------------
+                    # 2. Remove phantom DB records
+                    # -----------------------------------------
+
+                    cur.execute(
+                        """
+                        SELECT id, file_path
+                        FROM downloads
+                        """
+                    )
+
+                    all_records = cur.fetchall()
+
+                    for record in all_records:
+
+                        if not os.path.exists(
+                            record["file_path"]
+                        ):
+
+                            cur.execute(
+                                """
+                                DELETE FROM downloads
+                                WHERE id = ?
+                                """,
+                                (
+                                    record["id"],
+                                )
+                            )
+
+                            db_cleaned += 1
+
+                    conn.commit()
+
+                return (
+                    deleted_files,
+                    db_cleaned
+                )
+
+            deleted_files, db_cleaned = (
+                await asyncio.to_thread(
+                    perform_cleanup
+                )
+            )
+
+            if (
+                deleted_files > 0
+                or
+                db_cleaned > 0
+            ):
+
+                logger.info(
+                    f"Cleanup complete: "
+                    f"Deleted {deleted_files} "
+                    f"old files on disk, "
+                    f"cleared {db_cleaned} "
+                    f"orphaned DB records."
+                )
+
+            else:
+
+                logger.info(
+                    "Cleanup complete: "
+                    "No expired files found."
+                )
+
+        except Exception as e:
+
+            logger.error(
+                "Cache cleanup encountered an error "
+                f"(will retry next cycle): {e}"
+            )
+
+        await asyncio.sleep(
+            3600
+        )
+
+
+# =========================================================
+# FASTAPI LIFESPAN
+# =========================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    logger.info(
+        "Starting MAGMA Music API..."
+    )
+
+    init_db()
+
+    # -----------------------------------------
+    # Load YouTube cookies
+    # -----------------------------------------
+    # Priority: COOKIE_BASE64 -> COOKIE_URL -> COOKIE_FILE_URL -> existing file.
+    # A cookie file is considered usable only if it looks like a Netscape
+    # cookies.txt file. This prevents yt-dlp from silently running without
+    # authentication after a bad/HTML download.
+
+    if COOKIE_BASE64:
+        try:
+            raw = base64.b64decode(COOKIE_BASE64, validate=True)
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(raw)
+            logger.info("Loaded cookies.txt from COOKIE_BASE64")
+        except Exception as e:
+            logger.error(f"Failed to decode COOKIE_BASE64: {e}")
+
+    elif COOKIE_URL or COOKIE_FILE_URL:
+        try:
+            request = urllib.request.Request(
+                COOKIE_URL or COOKIE_FILE_URL,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read()
+            with open(COOKIES_FILE, "wb") as f:
+                f.write(raw)
+            logger.info(
+                "Successfully downloaded cookies.txt from configured cookie URL"
+            )
+        except Exception as e:
+            logger.error(f"Failed to download cookies from cookie URL: {e}")
+
+    if os.path.exists(COOKIES_FILE):
+        try:
+            with open(COOKIES_FILE, "r", encoding="utf-8", errors="ignore") as f:
+                cookie_text = f.read(100000)
+            valid_cookie_file = (
+                "# Netscape HTTP Cookie File" in cookie_text
+                or "youtube.com" in cookie_text
+                or ".youtube.com" in cookie_text
+            )
+            if valid_cookie_file:
+                logger.info("YouTube cookie file detected and appears valid.")
+            else:
+                logger.error(
+                    "cookies.txt exists but does not look like a Netscape cookie file. "
+                    "YouTube authentication will be disabled until valid cookies are supplied."
+                )
+        except Exception as e:
+            logger.error(f"Could not validate cookies.txt: {e}")
+    elif USE_COOKIES:
+        logger.error(
+            "USE_COOKIES=true but no cookies.txt is available. "
+            "YouTube downloads requiring authentication will fail."
+        )
+
+    # -----------------------------------------
+    # Start cleanup worker
+    # -----------------------------------------
+
+    cleanup_worker = asyncio.create_task(
+        cache_cleanup_task()
+    )
+
+    yield
+
+    # -----------------------------------------
+    # Shutdown
+    # -----------------------------------------
+
+    logger.info(
+        "Shutting down MAGMA Music API..."
+    )
+
+    cleanup_worker.cancel()
+
+
+# =========================================================
+# FASTAPI APP
+# =========================================================
+
+app = FastAPI(
+    title="YouTube Downloader & Search API",
+    version="2.3.1-Production",
+    lifespan=lifespan
+)
+
+
+# =========================================================
+# CORS
+# =========================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+# =========================================================
+# MAGMA.HTML DEVELOPER PORTAL
+# =========================================================
+
+HTML_FILE = os.path.join(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    ),
+    "Magma.html"
+)
+
+try:
+
+    with open(
+        HTML_FILE,
+        "r",
+        encoding="utf-8"
+    ) as f:
+
+        DEVELOPER_PORTAL_HTML = f.read()
+
+    logger.info(
+        "Magma.html loaded successfully."
+    )
+
+except Exception as e:
+
+    logger.error(
+        f"Failed to load Magma.html: {e}"
+    )
+
+    DEVELOPER_PORTAL_HTML = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>MAGMA API</title>
+    </head>
+    <body>
+        <h1>MAGMA API</h1>
+        <p>
+            Developer portal could not be loaded.
+        </p>
+    </body>
+    </html>
+    """
+
+
+# =========================================================
+# YOUTUBE MUSIC
+# =========================================================
+
+ytmusic = YTMusic()
+
+
+# =========================================================
+# VIDEO ID EXTRACTION
+# =========================================================
+
+def extract_video_id(
+    url: str
+) -> Optional[str]:
+
+    """Extracts the 11-character YouTube Video ID."""
+
+    if not url:
+
+        return None
+
+    if re.match(
+        r"^[0-9A-Za-z_-]{11}$",
+        url
+    ):
+
+        return url
+
+    pattern = (
+        r"(?:youtu\.be\/|v=|\/shorts\/|"
+        r"\/embed\/|\/v\/)"
+        r"([0-9A-Za-z_-]{11})"
+    )
+
+    match = re.search(
+        pattern,
+        url
+    )
+
+    if match:
+
+        return match.group(1)
+
+    match = re.search(
+        r"[0-9A-Za-z_-]{11}",
+        url
+    )
+
+    return (
+        match.group(0)
+        if match
+        else None
+    )
+
+
+# =========================================================
+# BASE YT-DLP OPTIONS
+# =========================================================
+
+def get_base_ydl_opts() -> Dict[str, Any]:
+
+    opts = {
+
+        "outtmpl":
+            f"{DOWNLOAD_DIR}/%(title).150s_%(id)s.%(ext)s",
+
+        "restrictfilenames":
+            True,
+
+        "noplaylist":
+            True,
+
+        "quiet":
+            True,
+
+        "no_warnings":
+            True,
+
+        "retries":
+            RETRIES,
+
+        "fragment_retries":
+            FRAGMENT_RETRIES,
+
+        "socket_timeout":
+            SOCKET_TIMEOUT,
+
+        "continuedl":
+            True,
+
+        "js_runtimes":
+            {
+                "node": {}
+            },
+
+        "remote_components":
+            [
+                "ejs:github"
+            ]
+    }
+
+    if USE_COOKIES and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+        opts["cookiefile"] = COOKIES_FILE
+        logger.info("yt-dlp will use cookies.txt for YouTube authentication")
+    elif os.path.exists(COOKIES_FILE):
+        logger.info(f"Cookies file found but disabled (USE_COOKIES={USE_COOKIES})")
+
+    return opts
+
+
+def apply_youtube_extractor_args(opts: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply optional YouTube client overrides without overriding yt-dlp's
+    normal client selection when YOUTUBE_PLAYER_CLIENTS=default/empty."""
+    clients = [
+        c.strip() for c in YOUTUBE_PLAYER_CLIENTS.split(",") if c.strip()
+    ]
+    if clients and [c.lower() for c in clients] != ["default"]:
+        opts["extractor_args"] = {"youtube": {"player_client": clients}}
+    return opts
+
+
+# =========================================================
+# THUMBNAIL
+# =========================================================
+
+def fetch_thumbnail_sync(
+    url: str
+) -> Dict[str, Any]:
+
+    opts = get_base_ydl_opts()
+
+    opts["skip_download"] = True
+
+    try:
+
+        with yt_dlp.YoutubeDL(
+            opts
+        ) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+            return {
+
+                "title":
+                    info.get("title"),
+
+                "thumbnail":
+                    info.get("thumbnail"),
+
+                "videoId":
+                    info.get("id")
+            }
+
+    except Exception as e:
+
+        logger.error(
+            f"Thumbnail fetch error: {e}"
+        )
+
+        raise RuntimeError(
+            f"Failed to fetch thumbnail: {str(e)}"
+        )
+
+
+# =========================================================
+# AUDIO DOWNLOAD
+# =========================================================
+
+
+# =========================================================
+# AUDIO DOWNLOAD
+# =========================================================
+
+def download_audio_sync(url: str) -> Dict[str, Any]:
+    """Download one audio file with a single yt-dlp path.
+
+    Fast path is intentionally simple: cache first, then yt-dlp + FFmpeg.
+    Remote downloader APIs and duplicate fallback downloaders are avoided so
+    the API has predictable latency and no hidden 10-15s upstream wait.
+    """
+    video_id = extract_video_id(url)
+
+    if video_id:
+        cached_data = get_cached_metadata(video_id, "mp3")
+        if cached_data:
+            logger.info(f"⚡ [CACHE HIT] {video_id}")
+            return {
+                "status": True,
+                "title": cached_data["title"],
+                "duration": cached_data["duration"],
+                "thumbnail": cached_data["thumbnail"],
+                "filename": cached_data["file_name"],
+                "path": cached_data["file_path"],
+                "download_url": f"/files/{cached_data['file_name']}",
+                "videoId": video_id,
+                "uploader": "Cached",
+                "filesize": cached_data["file_size"],
+            }
+
+    started = time.perf_counter()
+    logger.info(f"⚡ [AUDIO] Starting yt-dlp download: {video_id or url}")
+
+    opts = get_base_ydl_opts()
+    opts.update({
+        "format": "ba[ext=m4a]/ba[ext=webm]/bestaudio/best",
+        "writethumbnail": False,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
         "concurrent_fragment_downloads": CONCURRENT_FRAGMENT_DOWNLOADS,
         "http_chunk_size": HTTP_CHUNK_SIZE,
         "nocheckcertificate": True,
-    }
-    if COOKIE_FILE.is_file():
-        options["cookiefile"] = str(COOKIE_FILE)
-    return options
+        "noprogress": True,
+        "quiet": True,
+        "no_warnings": True,
+        "updatetime": False,
+        "clean_infojson": False,
+        "retries": min(RETRIES, 3),
+        "fragment_retries": min(FRAGMENT_RETRIES, 3),
+        "socket_timeout": SOCKET_TIMEOUT,
+        "postprocessor_args": ["-threads", "0", "-vn", "-sn"],
+    })
+    apply_youtube_extractor_args(opts)
 
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-def cached_record(video_id: str, media_type: str) -> Optional[Dict[str, Any]]:
-    with sqlite3.connect(DB_FILE, timeout=15) as connection:
-        connection.row_factory = sqlite3.Row
-        row = connection.execute(
-            """
-            SELECT video_id, media_type, title, file_name, file_path, file_size,
-                   duration, thumbnail, uploader, created_at
-            FROM downloads
-            WHERE video_id = ? AND media_type = ?
-            """,
-            (video_id, media_type),
-        ).fetchone()
+            base_path, _ = os.path.splitext(filename)
+            final_path = f"{base_path}.mp3"
 
-    if not row:
-        return None
-    if CACHE_EXPIRE_HOURS > 0 and (
-        time.time() - row["created_at"] > CACHE_EXPIRE_HOURS * 3600
-    ):
-        return None
-    if not Path(row["file_path"]).is_file() or row["file_size"] <= 0:
-        return None
-    return dict(row)
+            if not os.path.isfile(final_path) or os.path.getsize(final_path) <= 0:
+                raise RuntimeError("Downloaded file is missing or empty.")
 
-
-def save_record(data: Dict[str, Any], media_type: str) -> None:
-    with sqlite3.connect(DB_FILE, timeout=15) as connection:
-        connection.execute(
-            """
-            INSERT OR REPLACE INTO downloads
-            (video_id, media_type, title, file_name, file_path, file_size,
-             duration, thumbnail, uploader, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                data["videoId"],
-                media_type,
-                data.get("title", ""),
-                data["filename"],
-                data["path"],
-                data.get("filesize", 0),
-                data.get("duration", 0) or 0,
-                data.get("thumbnail", ""),
-                data.get("uploader", ""),
-                time.time(),
-            ),
-        )
-        connection.commit()
-
-
-def record_response(record: Dict[str, Any], *, cached: bool = True) -> Dict[str, Any]:
-    return {
-        "service": SERVICE_NAME,
-        "status": True,
-        "cached": cached,
-        "title": record.get("title", ""),
-        "duration": record.get("duration", 0) or 0,
-        "thumbnail": record.get("thumbnail", ""),
-        "filename": record["file_name"] if "file_name" in record else record["filename"],
-        "path": record["file_path"] if "file_path" in record else record["path"],
-        "download_url": (
-            "/files/"
-            + (
-                record["file_name"]
-                if "file_name" in record
-                else record["filename"]
+            size = os.path.getsize(final_path)
+            elapsed = time.perf_counter() - started
+            logger.info(
+                f"✅ [AUDIO SUCCESS] {info.get('id', video_id)}: "
+                f"{size / 1048576:.2f} MB in {elapsed:.2f}s"
             )
-        ),
-        "videoId": record["video_id"] if "video_id" in record else record["videoId"],
-        "uploader": record.get("uploader", ""),
-        "filesize": record.get("file_size", record.get("filesize", 0)),
-    }
+
+            response_data = {
+                "status": True,
+                "title": info.get("title", ""),
+                "duration": info.get("duration", 0),
+                "thumbnail": info.get("thumbnail", ""),
+                "filename": os.path.basename(final_path),
+                "path": final_path,
+                "download_url": f"/files/{os.path.basename(final_path)}",
+                "videoId": info.get("id") or video_id,
+                "uploader": info.get("uploader"),
+                "filesize": size,
+            }
+            save_cached_metadata(response_data, "mp3")
+            return response_data
+
+    except yt_dlp.utils.DownloadError as e:
+        message = str(e)
+        logger.error(f"❌ [AUDIO FAILED] yt-dlp: {message}")
+        lower = message.lower()
+        if "sign in to confirm" in lower or "not a bot" in lower:
+            if not (USE_COOKIES and os.path.isfile(COOKIES_FILE)):
+                raise RuntimeError(
+                    "YouTube requires authentication for this request. "
+                    "Set USE_COOKIES=true and provide valid cookies.txt via "
+                    "COOKIE_BASE64, COOKIE_URL, or COOKIE_FILE_URL."
+                ) from e
+            raise RuntimeError(
+                "YouTube rejected the supplied session as automated traffic. "
+                "The cookies may be expired, invalid, or not usable from this server's IP. "
+                "Export fresh YouTube cookies and redeploy them."
+            ) from e
+        raise RuntimeError(f"Download Error: {message}") from e
+    except Exception as e:
+        logger.error(f"❌ [AUDIO FAILED] {e}")
+        raise RuntimeError(f"Internal Server Error: {str(e)}") from e
 
 
-def absolute_url(request: Request, path: str) -> str:
-    """Return a URL Telegram bots can fetch from outside this process."""
-    public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-    base_url = public_base_url or str(request.base_url).rstrip("/")
-    return f"{base_url}/{path.lstrip('/')}"
+# =========================================================
+# VIDEO DOWNLOAD
+# =========================================================
 
-
-def telegram_compatible_response(
-    result: Dict[str, Any], request: Request
+def download_video_sync(
+    url: str
 ) -> Dict[str, Any]:
-    """Add the response aliases used by common Telegram music bots.
 
-    The canonical VelocityBots field is ``download_url``.  The aliases are
-    intentionally harmless and make migration easier for bots that already
-    expect a different downloader response shape.
-    """
-    file_url = absolute_url(request, result["download_url"])
-    live_url = (
-        absolute_url(request, "/download")
-        + "?url="
-        + quote(result["videoId"])
-        + "&live=true"
-    )
-    response = dict(result)
-    response.update(
-        {
-            "success": True,
-            "ok": True,
-            "url": file_url,
-            "file_url": file_url,
-            "audio_url": file_url,
-            "downloadUrl": file_url,
-            "download_url": file_url,
-            "stream_url": live_url,
-            "streamUrl": live_url,
-            "file_name": result["filename"],
-            "fileSize": result["filesize"],
-            "video_id": result["videoId"],
-            "mime_type": "audio/mpeg",
-            "type": "audio",
-        }
-    )
-    return response
-
-
-def live_audio_generator(url: str):
-    """Yield MP3 bytes while yt-dlp downloads and FFmpeg encodes.
-
-    This deliberately does not write to the normal cache: a progressive
-    response must begin immediately, while the cache requires a complete,
-    verified file. Bots that need cache hits should use /stream or /download.
-    """
-    ytdlp_args = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--quiet",
-        "--no-warnings",
-        "--no-playlist",
-        "--no-progress",
-        "--retries",
-        str(RETRIES),
-        "--fragment-retries",
-        str(FRAGMENT_RETRIES),
-        "--socket-timeout",
-        str(SOCKET_TIMEOUT),
-        "--concurrent-fragments",
-        str(CONCURRENT_FRAGMENT_DOWNLOADS),
-        "--http-chunk-size",
-        str(HTTP_CHUNK_SIZE),
-        "--format",
-        "ba[ext=m4a]/ba[ext=webm]/bestaudio/best",
-        "--output",
-        "-",
-        url,
-    ]
-    if COOKIE_FILE.is_file():
-        ytdlp_args[2:2] = ["--cookies", str(COOKIE_FILE)]
-
-    ytdlp_process = subprocess.Popen(
-        ytdlp_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    ffmpeg_process = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-fflags",
-            "nobuffer",
-            "-i",
-            "pipe:0",
-            "-vn",
-            "-sn",
-            "-f",
-            "mp3",
-            "-b:a",
-            os.getenv("AUDIO_QUALITY", "192") + "k",
-            "-flush_packets",
-            "1",
-            "pipe:1",
-        ],
-        stdin=ytdlp_process.stdout,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    if ytdlp_process.stdout:
-        ytdlp_process.stdout.close()
-
-    try:
-        if not ffmpeg_process.stdout:
-            return
-        while True:
-            chunk = ffmpeg_process.stdout.read(64 * 1024)
-            if not chunk:
-                break
-            yield chunk
-        ffmpeg_process.wait()
-        ytdlp_process.wait()
-        if ffmpeg_process.returncode != 0 or ytdlp_process.returncode != 0:
-            logger.error(
-                "Live audio process failed: yt-dlp=%s ffmpeg=%s",
-                ytdlp_process.returncode,
-                ffmpeg_process.returncode,
-            )
-    finally:
-        for process in (ffmpeg_process, ytdlp_process):
-            if process.poll() is None:
-                process.kill()
-        if ffmpeg_process.stdout:
-            ffmpeg_process.stdout.close()
-
-
-def live_audio_response(url: str) -> StreamingResponse:
-    return StreamingResponse(
-        live_audio_generator(url),
-        media_type="audio/mpeg",
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Disposition": 'inline; filename="velocitybots.mp3"',
-            "X-Accel-Buffering": "no",
-        },
+    video_id = extract_video_id(
+        url
     )
 
+    # -----------------------------------------
+    # DATABASE CACHE
+    # -----------------------------------------
 
-async def resolve_download_input(
-    url: Optional[str],
-    query: Optional[str],
-) -> str:
-    """Resolve either a URL/ID or a search phrase to a YouTube URL."""
-    source = (url or "").strip()
-    if source:
-        return normalize_url(source)
-
-    phrase = (query or "").strip()
-    if not phrase:
-        raise HTTPException(
-            status_code=422,
-            detail="Send one of: url, video, link, q, query, song, or search.",
-        )
-
-    try:
-        results = await asyncio.to_thread(
-            lambda: YTMusic().search(phrase, filter="songs", limit=1)
-        )
-        if not results or not results[0].get("videoId"):
-            raise HTTPException(
-                status_code=404,
-                detail="No matching song was found.",
-            )
-        return normalize_url(results[0]["videoId"])
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise error_response("Could not resolve the search query", exc)
-
-
-def download_audio_sync(url: str) -> Dict[str, Any]:
-    url = normalize_url(url)
-    video_id = extract_video_id(url)
     if video_id:
-        cached = cached_record(video_id, "mp3")
-        if cached:
-            logger.info("Audio cache hit: %s", video_id)
-            return record_response(cached, cached=True)
 
-    started = time.perf_counter()
-    options = base_ydl_options()
-    options.update(
-        {
-            "format": "ba[ext=m4a]/ba[ext=webm]/bestaudio/best",
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": os.getenv("AUDIO_QUALITY", "192"),
+        cached_data = get_cached_metadata(
+            video_id,
+            "mp4"
+        )
+
+        if cached_data:
+
+            logger.info(
+                f"Database cache hit! "
+                f"Returning video for {video_id}"
+            )
+
+            return {
+
+                "status":
+                    True,
+
+                "title":
+                    cached_data["title"],
+
+                "thumbnail":
+                    cached_data["thumbnail"],
+
+                "filename":
+                    cached_data["file_name"],
+
+                "path":
+                    cached_data["file_path"],
+
+                "download_url":
+                    f"/files/"
+                    f"{cached_data['file_name']}",
+
+                "duration":
+                    cached_data["duration"],
+
+                "videoId":
+                    video_id,
+
+                "uploader":
+                    "Cached",
+
+                "filesize":
+                    cached_data["file_size"]
+            }
+
+        # -----------------------------------------
+        # LEGACY CACHE
+        # -----------------------------------------
+
+        legacy_file = find_legacy_cached_file(
+            video_id,
+            "mp4"
+        )
+
+        if legacy_file:
+
+            path = os.path.join(
+                DOWNLOAD_DIR,
+                legacy_file
+            )
+
+            if (
+                os.path.isfile(path)
+                and
+                os.path.getsize(path) > 0
+            ):
+
+                logger.info(
+                    f"Legacy disk cache hit "
+                    f"for {video_id}. "
+                    "Saving to DB."
+                )
+
+                data = {
+
+                    "videoId":
+                        video_id,
+
+                    "title":
+                        legacy_file[
+                            :-
+                            len(
+                                f"_{video_id}.mp4"
+                            )
+                        ],
+
+                    "filename":
+                        legacy_file,
+
+                    "path":
+                        path,
+
+                    "type":
+                        "mp4",
+
+                    "filesize":
+                        os.path.getsize(path),
+
+                    "duration":
+                        0,
+
+                    "thumbnail":
+                        f"https://i.ytimg.com/vi/"
+                        f"{video_id}/hqdefault.jpg"
                 }
-            ],
-            "postprocessor_args": ["-threads", "0", "-vn", "-sn"],
-        }
+
+                save_cached_metadata(
+                    data,
+                    "mp4"
+                )
+
+                data["status"] = True
+
+                data["download_url"] = (
+                    f"/files/{legacy_file}"
+                )
+
+                data["uploader"] = "Cached"
+
+                return data
+
+    # -----------------------------------------
+    # ACTUAL DOWNLOAD
+    # -----------------------------------------
+
+    logger.info(
+        f"Starting video download for: {url}"
     )
 
+    opts = get_base_ydl_opts()
+
+    opts.update({
+
+        "format":
+            f"bv*[height<={MAX_VIDEO_QUALITY}]"
+            f"[ext=mp4]+ba[ext=m4a]/"
+            f"b[height<={MAX_VIDEO_QUALITY}]"
+            f"[ext=mp4]/best",
+
+        "merge_output_format":
+            "mp4",
+
+        "writethumbnail":
+            False,
+
+        "embedthumbnail":
+            False,
+
+        # -----------------------------------------
+        # ENV CONFIGURABLE SPEED SETTINGS
+        # -----------------------------------------
+
+        "concurrent_fragment_downloads":
+            CONCURRENT_FRAGMENT_DOWNLOADS,
+
+        "http_chunk_size":
+            HTTP_CHUNK_SIZE,
+
+        "nocheckcertificate":
+            True,
+
+        "noprogress":
+            True,
+
+        "quiet":
+            True,
+
+        "no_warnings":
+            True,
+
+        "updatetime":
+            False,
+
+        "clean_infojson":
+            False,
+
+        "retries":
+            RETRIES,
+
+        "fragment_retries":
+            FRAGMENT_RETRIES,
+
+        "socket_timeout":
+            SOCKET_TIMEOUT,
+
+        "postprocessor_args": [
+
+            "-threads",
+            "0"
+        ]
+    })
+    apply_youtube_extractor_args(opts)
+
     try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            prepared = Path(ydl.prepare_filename(info))
-            final_path = prepared.with_suffix(".mp3")
-            if not final_path.is_file() or final_path.stat().st_size <= 0:
-                raise RuntimeError("The MP3 file was not created.")
 
-        result = {
-            "title": info.get("title", ""),
-            "duration": info.get("duration", 0) or 0,
-            "thumbnail": info.get("thumbnail", ""),
-            "filename": final_path.name,
-            "path": str(final_path),
-            "videoId": info.get("id") or video_id,
-            "uploader": info.get("uploader", ""),
-            "filesize": final_path.stat().st_size,
-        }
-        save_record(result, "mp3")
-        logger.info(
-            "Audio ready: %s in %.2fs",
-            result["videoId"],
-            time.perf_counter() - started,
-        )
-        return record_response(result, cached=False)
-    except yt_dlp.utils.DownloadError as exc:
-        raise RuntimeError(f"Download error: {exc}") from exc
+        with yt_dlp.YoutubeDL(
+            opts
+        ) as ydl:
 
-
-def download_video_sync(url: str) -> Dict[str, Any]:
-    url = normalize_url(url)
-    video_id = extract_video_id(url)
-    if video_id:
-        cached = cached_record(video_id, "mp4")
-        if cached:
-            logger.info("Video cache hit: %s", video_id)
-            return record_response(cached, cached=True)
-
-    options = base_ydl_options()
-    options.update(
-        {
-            "format": (
-                f"bv*[height<={MAX_VIDEO_QUALITY}][ext=mp4]+ba[ext=m4a]/"
-                f"b[height<={MAX_VIDEO_QUALITY}][ext=mp4]/best"
-            ),
-            "merge_output_format": "mp4",
-            "postprocessor_args": ["-threads", "0"],
-        }
-    )
-
-    try:
-        with yt_dlp.YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=True)
-            prepared = Path(ydl.prepare_filename(info))
-            candidates = [
-                prepared.with_suffix(".mp4"),
-                prepared.with_suffix(".webm"),
-                prepared.with_suffix(".mkv"),
-            ]
-            final_path = next(
-                (candidate for candidate in candidates if candidate.is_file()),
-                None,
+            info = ydl.extract_info(
+                url,
+                download=True
             )
-            if not final_path or final_path.stat().st_size <= 0:
-                raise RuntimeError("The video file was not created.")
 
-        result = {
-            "title": info.get("title", ""),
-            "duration": info.get("duration", 0) or 0,
-            "thumbnail": info.get("thumbnail", ""),
-            "filename": final_path.name,
-            "path": str(final_path),
-            "videoId": info.get("id") or video_id,
-            "uploader": info.get("uploader", ""),
-            "filesize": final_path.stat().st_size,
-        }
-        save_record(result, "mp4")
-        return record_response(result, cached=False)
-    except yt_dlp.utils.DownloadError as exc:
-        raise RuntimeError(f"Download error: {exc}") from exc
+            filename = ydl.prepare_filename(
+                info
+            )
+
+            base_path, _ = os.path.splitext(
+                filename
+            )
+
+            final_path = (
+                f"{base_path}.mp4"
+            )
+
+            # -----------------------------------------
+            # Check possible output extensions
+            # -----------------------------------------
+
+            for ext in [
+                ".mp4",
+                ".webm",
+                ".mkv"
+            ]:
+
+                test_path = (
+                    f"{base_path}{ext}"
+                )
+
+                if (
+                    os.path.isfile(
+                        test_path
+                    )
+                    and
+                    os.path.getsize(
+                        test_path
+                    ) > 0
+                ):
+
+                    final_path = test_path
+
+                    break
+
+            if not (
+                os.path.isfile(
+                    final_path
+                )
+                and
+                os.path.getsize(
+                    final_path
+                ) > 0
+            ):
+
+                raise RuntimeError(
+                    "Downloaded file not found "
+                    "or is empty."
+                )
+
+            logger.info(
+                f"Successfully downloaded video: "
+                f"{final_path}"
+            )
+
+            response_data = {
+
+                "status":
+                    True,
+
+                "title":
+                    info.get(
+                        "title",
+                        ""
+                    ),
+
+                "thumbnail":
+                    info.get(
+                        "thumbnail",
+                        ""
+                    ),
+
+                "filename":
+                    os.path.basename(
+                        final_path
+                    ),
+
+                "path":
+                    final_path,
+
+                "download_url":
+                    f"/files/"
+                    f"{os.path.basename(final_path)}",
+
+                "duration":
+                    info.get(
+                        "duration",
+                        0
+                    ),
+
+                "videoId":
+                    info.get("id"),
+
+                "uploader":
+                    info.get("uploader"),
+
+                "filesize":
+                    os.path.getsize(
+                        final_path
+                    )
+            }
+
+            save_cached_metadata(
+                response_data,
+                "mp4"
+            )
+
+            return response_data
+
+    except yt_dlp.utils.DownloadError as e:
+
+        logger.error(
+            f"yt-dlp error downloading video "
+            f"for {url}: {e}"
+        )
+
+        raise RuntimeError(
+            f"Download Error: {str(e)}"
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Unexpected error downloading video "
+            f"for {url}: {e}"
+        )
+
+        raise RuntimeError(
+            f"Internal Server Error: {str(e)}"
+        )
 
 
-def error_response(message: str, exc: Exception) -> HTTPException:
-    logger.exception("%s", message)
-    return HTTPException(
-        status_code=500,
-        detail={"error": message, "message": str(exc)},
+# =========================================================
+# ROOT — DEVELOPER PORTAL
+# =========================================================
+
+@app.get(
+    "/",
+    response_class=HTMLResponse
+)
+async def root():
+
+    return HTMLResponse(
+        content=DEVELOPER_PORTAL_HTML,
+        status_code=200
     )
 
 
-PORTAL_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>VelocityBots API</title>
-  <style>
-    :root{color-scheme:dark;--bg:#071019;--panel:#0d1b28;--line:#1d3446;
-      --text:#e9f4fb;--muted:#8da5b7;--cyan:#43e0ff;--lime:#b8f36b}
-    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 85% 0,#123a4f 0,transparent 35%),var(--bg);
-      color:var(--text);font:15px/1.6 Inter,system-ui,sans-serif}
-    main{max-width:1000px;margin:auto;padding:28px 20px 64px}.nav{display:flex;justify-content:space-between;align-items:center;
-      padding:8px 0 54px}.brand{font-weight:800;font-size:20px;letter-spacing:-.5px}.brand b{color:var(--cyan)}
-    .badge{border:1px solid #2b5265;border-radius:99px;padding:5px 11px;color:var(--lime);font-size:12px}
-    .hero{max-width:720px;padding:20px 0 48px}.eyebrow{color:var(--cyan);font:700 12px ui-monospace,monospace;letter-spacing:1.8px;text-transform:uppercase}
-    h1{font-size:clamp(42px,8vw,78px);line-height:.98;letter-spacing:-4px;margin:13px 0 20px}
-    h1 span{color:var(--cyan)}.hero p{color:var(--muted);font-size:17px;max-width:610px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}.card{background:#0b1824cc;border:1px solid var(--line);border-radius:16px;padding:20px}
-    .card h2{font-size:16px;margin:0 0 12px}.route{display:flex;gap:10px;align-items:center;font:700 14px ui-monospace,monospace}
-    .method{color:var(--lime);font-size:11px}.route code{color:var(--cyan)}.card p{color:var(--muted);margin:8px 0 0;font-size:13px}
-    pre{overflow:auto;background:#061019;border:1px solid var(--line);border-radius:12px;padding:16px;color:#c6e5f0;font:13px/1.6 ui-monospace,monospace}
-    footer{color:var(--muted);font-size:12px;margin-top:40px}
-  </style>
-</head>
-<body><main>
-  <nav class="nav"><div class="brand">Velocity<b>Bots</b></div><div class="badge">● API online</div></nav>
-  <section class="hero"><div class="eyebrow">Fast media infrastructure</div>
-    <h1>Download at the speed of <span>motion.</span></h1>
-    <p>VelocityBots is a cache-first YouTube media API for music bots, apps, and automations. One key, predictable endpoints, no remote downloader hop.</p>
-  </section>
-  <section class="grid">
-    <article class="card"><h2>Audio metadata</h2><div class="route"><span class="method">GET</span><code>/download</code></div><p>Downloads or reuses an MP3 and returns its metadata plus a file URL.</p></article>
-    <article class="card"><h2>Direct audio</h2><div class="route"><span class="method">GET</span><code>/stream</code></div><p>Downloads or reuses an MP3 and streams it in the same request.</p></article>
-    <article class="card"><h2>Search</h2><div class="route"><span class="method">GET</span><code>/search?q=...</code></div><p>Searches YouTube Music for songs and returns bot-friendly metadata.</p></article>
-    <article class="card"><h2>Video</h2><div class="route"><span class="method">GET</span><code>/video</code></div><p>Returns cached or newly downloaded video metadata. Use /video-stream for the file.</p></article>
-  </section>
-  <section class="card" style="margin-top:14px"><h2>Quick start</h2>
-    <pre>curl -H "X-API-Key: YOUR_KEY" \
-  "https://YOUR_HOST/download?url=https://youtu.be/VIDEO_ID"</pre>
-    <p>Interactive OpenAPI docs: <a href="/docs" style="color:var(--cyan)">/docs</a></p>
-  </section>
-  <footer>VelocityBots API v1 · API key required for media endpoints · FFmpeg powered</footer>
-</main></body></html>
-"""
-
-
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def root() -> HTMLResponse:
-    return HTMLResponse(PORTAL_HTML)
-
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
-async def health() -> Dict[str, Any]:
+async def health_check():
+
     return {
-        "service": SERVICE_NAME,
-        "status": "healthy",
-        "version": VERSION,
-        "cache_expiry_hours": CACHE_EXPIRE_HOURS,
+
+        "status":
+            "healthy",
+
+        "version":
+            "2.4.0",
+
+        "yt_dlp_version":
+            yt_dlp.version.__version__,
+
+        "cache_expiry_hours":
+            CACHE_EXPIRE_HOURS,
+        "youtube_cookies_enabled": USE_COOKIES and os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0,
+        "youtube_client_override": YOUTUBE_PLAYER_CLIENTS if YOUTUBE_PLAYER_CLIENTS.lower() != "default" else "yt-dlp-default"
     }
 
 
-@app.get("/search")
-async def search(
-    q: str = Query(..., min_length=1, max_length=200),
-    limit: int = Query(1, ge=1, le=20),
-    _: bool = Depends(require_api_key),
-) -> Any:
-    try:
-        results = await asyncio.to_thread(
-            lambda: YTMusic().search(q, filter="songs", limit=limit)
-        )
-        formatted = []
-        for item in results:
-            thumbnails = item.get("thumbnails") or []
-            formatted.append(
-                {
-                    "title": item.get("title", ""),
-                    "artist": ", ".join(
-                        artist.get("name", "")
-                        for artist in item.get("artists", [])
-                    ),
-                    "videoId": item.get("videoId"),
-                    "duration": item.get("duration"),
-                    "thumbnail": thumbnails[-1].get("url") if thumbnails else None,
-                }
-            )
-        return formatted[0] if limit == 1 and formatted else (
-            {} if limit == 1 else formatted
-        )
-    except Exception as exc:
-        raise error_response("Search failed", exc)
+# =========================================================
+# SEARCH
+# =========================================================
 
+@app.get("/search")
+async def search_youtube_music(
+
+    _: bool = Depends(require_api_key),
+
+    q: str = Query(
+        ...,
+        description="Search query"
+    ),
+
+    limit: int = Query(
+        1,
+        description=
+            "Number of results to return (max 20)"
+    )
+):
+
+    try:
+
+        logger.info(
+            f"Received search request "
+            f"for query '{q}' "
+            f"with limit {limit}"
+        )
+
+        actual_limit = min(
+            max(
+                1,
+                limit
+            ),
+            20
+        )
+
+        def perform_search():
+
+            return ytmusic.search(
+                q,
+                filter="songs",
+                limit=actual_limit
+            )
+
+        results = await asyncio.to_thread(
+            perform_search
+        )
+
+        formatted_results = []
+
+        for r in results:
+
+            artists = ", ".join(
+                [
+                    a.get(
+                        "name",
+                        ""
+                    )
+                    for a in r.get(
+                        "artists",
+                        []
+                    )
+                ]
+            )
+
+            thumbnails = r.get(
+                "thumbnails",
+                []
+            )
+
+            thumbnail_url = (
+                thumbnails[-1].get(
+                    "url"
+                )
+                if thumbnails
+                else None
+            )
+
+            formatted_results.append({
+
+                "title":
+                    r.get("title"),
+
+                "artist":
+                    artists,
+
+                "videoId":
+                    r.get("videoId"),
+
+                "duration":
+                    r.get("duration"),
+
+                "thumbnail":
+                    thumbnail_url
+            })
+
+        logger.info(
+            f"Successfully completed search "
+            f"for query '{q}', "
+            f"returned "
+            f"{len(formatted_results)} "
+            f"result(s)"
+        )
+
+        if actual_limit == 1:
+
+            return (
+                formatted_results[0]
+                if formatted_results
+                else {}
+            )
+
+        return formatted_results
+
+    except Exception as e:
+
+        logger.error(
+            f"Search error for query '{q}': {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+
+                "error":
+                    "Search failed",
+
+                "message":
+                    str(e)
+            }
+        )
+
+
+# =========================================================
+# THUMBNAIL API
+# =========================================================
 
 @app.get("/thumbnail")
-async def thumbnail(
-    url: str = Query(..., min_length=1, max_length=2048),
-    _: bool = Depends(require_api_key),
-) -> Dict[str, Any]:
-    try:
-        normalized = normalize_url(url)
-        options = base_ydl_options()
-        options["skip_download"] = True
-        info = await asyncio.to_thread(
-            lambda: yt_dlp.YoutubeDL(options).extract_info(
-                normalized, download=False
-            )
-        )
-        return {
-            "service": SERVICE_NAME,
-            "title": info.get("title", ""),
-            "thumbnail": info.get("thumbnail", ""),
-            "videoId": info.get("id"),
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise error_response("Thumbnail lookup failed", exc)
+async def get_thumbnail(
 
+    _: bool = Depends(require_api_key),
+
+    url: str = Query(
+        ...,
+        description="YouTube URL"
+    )
+):
+
+    try:
+
+        result = await asyncio.to_thread(
+            fetch_thumbnail_sync,
+            url
+        )
+
+        return result
+
+    except Exception as e:
+
+        logger.error(
+            f"Thumbnail API error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+
+                "error":
+                    "Failed to fetch thumbnail",
+
+                "message":
+                    str(e)
+            }
+        )
+
+
+# =========================================================
+# AUDIO DOWNLOAD API
+# =========================================================
 
 @app.get("/download")
-@app.post("/download")
-@app.get("/api/download")
-@app.post("/api/download")
-async def download(
-    request: Request,
-    url: Optional[str] = Query(
-        default=None,
-        max_length=2048,
-        description="YouTube URL or video ID",
-    ),
-    video: Optional[str] = Query(
-        default=None,
-        max_length=2048,
-        description="Compatibility alias for url",
-    ),
-    link: Optional[str] = Query(
-        default=None,
-        max_length=2048,
-        description="Compatibility alias for url",
-    ),
-    q: Optional[str] = Query(
-        default=None,
-        max_length=300,
-        description="Compatibility alias for query",
-    ),
-    query: Optional[str] = Query(
-        default=None,
-        max_length=300,
-        description="Song search phrase",
-    ),
-    song: Optional[str] = Query(
-        default=None,
-        max_length=300,
-        description="Compatibility alias for query",
-    ),
-    search: Optional[str] = Query(
-        default=None,
-        max_length=300,
-        description="Compatibility alias for query",
-    ),
-    direct: bool = Query(
-        default=False,
-        description="Return the audio file instead of JSON metadata",
-    ),
-    live: bool = Query(
-        default=False,
-        description="Start sending MP3 bytes while the source is still downloading",
-    ),
-    payload: Optional[Dict[str, Any]] = Body(
-        default=None,
-        description="Optional JSON body for POST clients",
-    ),
-    _: bool = Depends(require_api_key),
-) -> Any:
-    payload = payload or {}
-    source_url = (
-        url
-        or video
-        or link
-        or payload.get("url")
-        or payload.get("video")
-        or payload.get("link")
-        or payload.get("video_url")
-        or payload.get("videoId")
-    )
-    source_query = (
-        q
-        or query
-        or song
-        or search
-        or payload.get("q")
-        or payload.get("query")
-        or payload.get("song")
-        or payload.get("search")
-    )
-    try:
-        resolved_url = await resolve_download_input(source_url, source_query)
-        if live or str(payload.get("live", "")).lower() in {
-            "1",
-            "true",
-            "yes",
-        }:
-            return live_audio_response(resolved_url)
-        result = await asyncio.to_thread(download_audio_sync, resolved_url)
-        if direct or str(payload.get("direct", "")).lower() in {
-            "1",
-            "true",
-            "yes",
-        }:
-            return media_file_response(result, "audio/mpeg")
-        return JSONResponse(telegram_compatible_response(result, request))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise error_response("Audio download failed", exc)
+async def download_audio(
 
+    _: bool = Depends(require_api_key),
+
+    url: str = Query(
+        ...,
+        description="YouTube URL"
+    ),
+    download_type: Optional[str] = Query(
+        default=None,
+        alias="type",
+        description="Use audio for a direct audio stream"
+    )
+):
+
+    # The music bot calls /download?type=audio and expects audio bytes, not
+    # the metadata JSON used by the normal /download endpoint. Route that
+    # compatibility form through the same low-latency stream path.
+    if (download_type or "").lower() in {"audio", "mp3", "stream"}:
+        return await stream_audio(True, url)
+
+    try:
+
+        result = await asyncio.to_thread(
+            download_audio_sync,
+            url
+        )
+
+        return JSONResponse(
+            content=result
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Audio download API error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+
+                "error":
+                    "Audio download failed",
+
+                "message":
+                    str(e)
+            }
+        )
+
+
+# =========================================================
+# VIDEO DOWNLOAD API
+# =========================================================
 
 @app.get("/video")
-async def video(
-    url: str = Query(..., min_length=1, max_length=2048),
+async def download_video(
+
     _: bool = Depends(require_api_key),
-) -> JSONResponse:
-    try:
-        return JSONResponse(await asyncio.to_thread(download_video_sync, url))
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise error_response("Video download failed", exc)
 
-
-async def direct_file(
-    url: str, *, media_type: str, downloader: Any
-) -> FileResponse:
-    try:
-        result = await asyncio.to_thread(downloader, url)
-        return media_file_response(result, media_type)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise error_response("Media streaming failed", exc)
-
-
-def media_file_response(result: Dict[str, Any], media_type: str) -> FileResponse:
-    path = Path(result["path"]).resolve()
-    if DOWNLOAD_DIR not in path.parents or not path.is_file():
-        raise HTTPException(status_code=404, detail="Downloaded file not found.")
-    return FileResponse(
-        path=path,
-        filename=path.name,
-        media_type=media_type,
-        headers={"Cache-Control": "public, max-age=3600"},
+    url: str = Query(
+        ...,
+        description="YouTube URL"
     )
+):
+
+    try:
+
+        result = await asyncio.to_thread(
+            download_video_sync,
+            url
+        )
+
+        return JSONResponse(
+            content=result
+        )
+
+    except Exception as e:
+
+        logger.error(
+            f"Video download API error: {e}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+
+                "error":
+                    "Video download failed",
+
+                "message":
+                    str(e)
+            }
+        )
+
+
+
+# =========================================================
+# DIRECT MEDIA STREAMING API
+# =========================================================
+
+async def proxy_remote_audio(url: str) -> StreamingResponse:
+    """Proxy a remote API's audio stream without buffering it locally."""
+    if not REMOTE_API_URL:
+        raise RuntimeError("REMOTE_API_URL is not configured")
+
+    started = time.perf_counter()
+    client = httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=httpx.Timeout(
+            REMOTE_READ_TIMEOUT,
+            connect=REMOTE_CONNECT_TIMEOUT,
+        ),
+    )
+    upstream = None
+
+    headers = {"Accept": "audio/mpeg"}
+    if REMOTE_API_KEY:
+        headers["X-API-Key"] = REMOTE_API_KEY
+
+    try:
+        request = client.build_request(
+            "GET",
+            f"{REMOTE_API_URL}/stream",
+            params={"url": url},
+            headers=headers,
+        )
+        upstream = await client.send(request, stream=True)
+
+        header_elapsed = time.perf_counter() - started
+        if upstream.status_code >= 400:
+            detail = (await upstream.aread()).decode("utf-8", errors="replace")[:1000]
+            status_code = upstream.status_code
+            await upstream.aclose()
+            await client.aclose()
+            logger.error(
+                f"❌ [REMOTE API FAILED] HTTP {status_code} after "
+                f"{header_elapsed:.2f}s: {detail}"
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"Remote audio API returned HTTP {status_code}",
+            )
+
+        response_headers = {"Cache-Control": "no-store"}
+        for header_name in (
+            "content-length",
+            "content-disposition",
+            "accept-ranges",
+        ):
+            value = upstream.headers.get(header_name)
+            if value:
+                response_headers[header_name] = value
+
+        media_type = upstream.headers.get("content-type", "audio/mpeg")
+        logger.info(
+            f"🚀 [REMOTE API] Response headers received for "
+            f"{extract_video_id(url) or url} after {header_elapsed:.2f}s "
+            f"(HTTP {upstream.status_code})"
+        )
+
+        first_chunk = True
+
+        async def body_iterator():
+            nonlocal first_chunk
+            transferred = 0
+            try:
+                async for chunk in upstream.aiter_bytes(
+                    chunk_size=REMOTE_CHUNK_SIZE
+                ):
+                    if first_chunk:
+                        first_chunk = False
+                        logger.info(
+                            f"⚡ [REMOTE API] First audio bytes received for "
+                            f"{extract_video_id(url) or url} after "
+                            f"{time.perf_counter() - started:.2f}s"
+                        )
+                    transferred += len(chunk)
+                    yield chunk
+            finally:
+                total_elapsed = time.perf_counter() - started
+                logger.info(
+                    f"🏁 [REMOTE API] Transfer finished for "
+                    f"{extract_video_id(url) or url}: "
+                    f"{transferred / 1048576:.2f} MB in "
+                    f"{total_elapsed:.2f}s"
+                )
+                await upstream.aclose()
+                await client.aclose()
+
+        return StreamingResponse(
+            body_iterator(),
+            status_code=upstream.status_code,
+            media_type=media_type,
+            headers=response_headers,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        if upstream is not None:
+            await upstream.aclose()
+        await client.aclose()
+        logger.error(f"❌ [REMOTE API ERROR] {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Remote audio API request failed",
+        ) from e
 
 
 @app.get("/stream")
-async def stream(
-    url: str = Query(..., min_length=1, max_length=2048),
+async def stream_audio(
     _: bool = Depends(require_api_key),
-) -> FileResponse:
-    return await direct_file(url, media_type="audio/mpeg", downloader=download_audio_sync)
+    url: str = Query(..., description="YouTube URL or video ID")
+):
+    """Download audio on the server and stream the finished MP3 directly.
 
+    This endpoint is optimized for music bots: one HTTP request and no
+    intermediate JSON -> /files round trip.
+    """
+    if REMOTE_API_URL:
+        return await proxy_remote_audio(url)
 
-@app.get("/live")
-async def live(
-    url: str = Query(..., min_length=1, max_length=2048),
-    _: bool = Depends(require_api_key),
-) -> StreamingResponse:
-    return live_audio_response(normalize_url(url))
+    try:
+        result = await asyncio.to_thread(download_audio_sync, url)
+        if not result or not result.get("status"):
+            raise HTTPException(status_code=500, detail="Audio download failed")
+
+        file_path = result.get("path")
+        filename = os.path.basename(result.get("filename") or file_path or "audio.mp3")
+        if not file_path or not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="Downloaded audio file not found")
+
+        file_size = os.path.getsize(file_path)
+        if file_size <= 1024:
+            raise HTTPException(status_code=500, detail="Downloaded audio file is empty")
+
+        logger.info(f"Direct audio stream ready: {filename} ({file_size / 1048576:.2f} MB)")
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="audio/mpeg",
+            headers={"Cache-Control": "no-store"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception(f"Direct audio stream error for {url}")
+        detail = {"error": "Audio streaming failed"}
+        if DEBUG_ERRORS:
+            detail["message"] = str(e)
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @app.get("/video-stream")
-async def video_stream(
-    url: str = Query(..., min_length=1, max_length=2048),
+async def stream_video(
     _: bool = Depends(require_api_key),
-) -> FileResponse:
-    return await direct_file(url, media_type="video/mp4", downloader=download_video_sync)
+    url: str = Query(..., description="YouTube URL or video ID")
+):
+    """Download video on the server and stream the finished file directly."""
+    try:
+        result = await asyncio.to_thread(download_video_sync, url)
+        if not result or not result.get("status"):
+            raise HTTPException(status_code=500, detail="Video download failed")
 
+        file_path = result.get("path")
+        filename = os.path.basename(result.get("filename") or file_path or "video.mp4")
+        if not file_path or not os.path.isfile(file_path):
+            raise HTTPException(status_code=404, detail="Downloaded video file not found")
+
+        file_size = os.path.getsize(file_path)
+        if file_size <= 1024:
+            raise HTTPException(status_code=500, detail="Downloaded video file is empty")
+
+        logger.info(f"Direct video stream ready: {filename} ({file_size / 1048576:.2f} MB)")
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type="video/mp4",
+            headers={"Cache-Control": "no-store"}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Direct video stream error for {url}: {e}")
+        raise HTTPException(status_code=500, detail="Video streaming failed")
+
+# =========================================================
+# FILE SERVING
+# =========================================================
 
 @app.get("/files/{filename}")
-async def files(
+async def get_file(
     filename: str,
-    _: bool = Depends(require_api_key),
-) -> FileResponse:
-    safe_name = Path(filename).name
-    path = (DOWNLOAD_DIR / safe_name).resolve()
-    if path.parent != DOWNLOAD_DIR or not path.is_file():
-        raise HTTPException(status_code=404, detail="File not found.")
+    _: bool = Depends(require_api_key)
+):
+
+    filename = os.path.basename(
+        filename
+    )
+
+    file_path = os.path.join(
+        DOWNLOAD_DIR,
+        filename
+    )
+
+    if not os.path.isfile(
+        file_path
+    ):
+
+        logger.warning(
+            f"Requested file not found: "
+            f"{filename}"
+        )
+
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
     return FileResponse(
-        path=path,
-        filename=safe_name,
-        headers={"Cache-Control": "public, max-age=3600"},
+        path=file_path,
+        filename=filename
     )
 
 
+# =========================================================
+# MAIN
+# =========================================================
+
 if __name__ == "__main__":
+
     import uvicorn
 
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
+    uvicorn.run(
+        "app:app",
+        host="0.0.0.0",
+        port=PORT,
+        reload=False
+    )

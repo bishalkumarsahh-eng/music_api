@@ -1,80 +1,108 @@
-# Deploy VelocityBots on Heroku
+# Heroku Deployment
 
-VelocityBots can run on Heroku using either the normal buildpack stack or the
-Docker/Container Stack. The Docker path is the most predictable because the
-included `Dockerfile` installs FFmpeg inside the image.
+This version is prepared for Heroku. It does not run `install.sh` during startup, does not create a Python virtualenv, and uses Heroku's `$PORT`.
 
-## Option A: Docker / Container Stack
+## Required buildpacks
 
-From the project directory:
+Add these buildpacks to the Heroku app:
 
 ```bash
-heroku login
-heroku create your-velocitybots-name
-heroku stack:set container -a your-velocitybots-name
-heroku container:login
-heroku container:push web -a your-velocitybots-name
-heroku container:release web -a your-velocitybots-name
+heroku buildpacks:clear
+heroku buildpacks:add heroku/python
+heroku buildpacks:add heroku/nodejs
+heroku buildpacks:add https://github.com/heroku/heroku-buildpack-apt
 ```
 
-Set the required config vars:
+The `Aptfile` installs FFmpeg. `package.json` provides Node.js for yt-dlp's EJS JavaScript runtime.
 
-```bash
-heroku config:set \
-  API_KEY="create-a-long-private-key" \
-  PUBLIC_BASE_URL="https://your-velocitybots-name.herokuapp.com" \
-  -a your-velocitybots-name
+## Config Vars
+
+```text
+COOKIE_URL=https://raw.githubusercontent.com/themagmalord333-oss/COOKIE/main/cookies.txt
+DOWNLOAD_DIR=downloads
+CACHE_EXPIRE_HOURS=0
+MAX_VIDEO_QUALITY=720
+DOWNLOAD_WORKERS=4
+CONCURRENT_FRAGMENT_DOWNLOADS=15
+HTTP_CHUNK_SIZE=10485760
+SOCKET_TIMEOUT=15
+RETRIES=5
+FRAGMENT_RETRIES=5
 ```
 
-For the optional private cookie URL:
+Do **not** set `PORT`; Heroku supplies it automatically.
+
+## Deploy
 
 ```bash
-heroku config:set \
-  COOKIE_URL="https://private-host.example/cookies.txt" \
-  COOKIE_FILE="cookies.txt" \
-  -a your-velocitybots-name
-```
-
-Check the service:
-
-```bash
-curl https://your-velocitybots-name.herokuapp.com/health
-```
-
-## Option B: Heroku buildpacks
-
-The repository includes `Aptfile` with FFmpeg and `app.json` with the buildpack
-configuration. If you configure buildpacks manually, use this order:
-
-```bash
-heroku buildpacks:clear -a your-velocitybots-name
-heroku buildpacks:add --index 1 \
-  https://github.com/heroku/heroku-buildpack-apt \
-  -a your-velocitybots-name
-heroku buildpacks:add --index 2 heroku/python -a your-velocitybots-name
+git add .
+git commit -m "Prepare API for Heroku"
 git push heroku main
 ```
 
-Then set the same `API_KEY`, `PUBLIC_BASE_URL`, and optional `COOKIE_URL`
-config vars from Option A. The included `Procfile` starts the web process on
-Heroku's assigned `$PORT`.
+If deploying from GitHub, connect the repository and deploy the branch normally after adding the buildpacks and Config Vars.
 
-## Telegram bot URL
+## Health check
 
-For progressive playback:
+After deployment:
 
 ```text
-https://your-velocitybots-name.herokuapp.com/download?url=YOUTUBE_URL&live=true
+https://YOUR-APP-NAME.herokuapp.com/health
 ```
 
-Send the API key using the `X-API-Key` header. The normal `/download` response
-remains JSON-compatible for bots that expect metadata.
+## Important
 
-## Important Heroku note
+Heroku's dyno filesystem is ephemeral. `downloads/` and `cache.db` can be removed when the dyno restarts or is redeployed. Use external object storage/database if downloaded files or cache must persist.
 
-Heroku's local filesystem is ephemeral. Downloaded MP3 cache files can be
-deleted whenever the dyno restarts or redeploys. The API still works; repeated
-downloads will simply fetch the source again after a restart.
+`cookies.txt` is intentionally not committed to this package. The app downloads it at startup from `COOKIE_URL` when that Config Var is set.
 
-Never commit `cookies.txt` or a real API key. Use Heroku config vars, and use a
-private or signed URL for `COOKIE_URL`.
+## API Key Authentication (v2.3.1)
+
+The API now protects `/search`, `/thumbnail`, `/download`, `/video`, and `/files/{filename}` with an API key.
+
+### 1. Create a strong API key
+
+On Windows PowerShell:
+
+```powershell
+[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }))
+```
+
+Or use any cryptographically random 32+ character secret.
+
+### 2. Add it to Heroku
+
+```bash
+heroku config:set API_KEY="YOUR_GENERATED_KEY" --app music-api-021d06c29284
+```
+
+Do not put the key in GitHub or share it publicly.
+
+### 3. Use the key from your Music Bot
+
+Send the key in the HTTP header:
+
+```text
+X-API-Key: YOUR_GENERATED_KEY
+```
+
+A Bearer token is also accepted:
+
+```text
+Authorization: Bearer YOUR_GENERATED_KEY
+```
+
+### Public endpoints
+
+`GET /` and `GET /health` remain public so uptime/health checkers can verify that the API is online.
+
+### Protected endpoints
+
+- `GET /search`
+- `GET /thumbnail`
+- `GET /download`
+- `GET /video`
+- `GET /files/{filename}`
+
+Without a valid key these return HTTP `401`.
+If `API_KEY` is missing from Heroku, protected endpoints return HTTP `503` so an accidentally unsecured deployment is not possible.

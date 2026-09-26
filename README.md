@@ -1,102 +1,56 @@
-# VelocityBots API
+# MAGMA Music API
 
-VelocityBots is a cache-first FastAPI media API for music bots and small
-applications. It is based on the useful parts of the supplied downloader
-reference, but has fresh branding, a smaller code path, URL validation, safer
-file handling, and no copied cookie file.
+Lean FastAPI YouTube/YouTube Music downloader API for music-bot backends.
+
+## Audio path
+1. Check SQLite cache.
+2. If cached, return immediately.
+3. Otherwise use one yt-dlp + FFmpeg download path.
+4. Save the finished MP3 and metadata to cache.
+
+There is no remote downloader dependency or duplicate audio fallback path. This avoids hidden upstream TTFB delays.
+
+### Optional fast upstream
+
+Set `REMOTE_API_URL` to use another Magma-compatible API for `/stream`. The
+proxy forwards the request headers and audio bytes as they arrive, so it does
+not wait for the complete MP3 before sending the first byte:
+
+```env
+REMOTE_API_URL=https://your-fast-api.example.com
+REMOTE_API_KEY=your-remote-api-key
+```
+
+When `REMOTE_API_URL` is empty, `/stream` keeps using the local yt-dlp +
+FFmpeg path. The remote API key is read from the environment and is never
+returned to callers.
+
+YouTube cookies are disabled by default because stale or IP-bound cookies can
+cause YouTube's `The page needs to be reloaded` error. Set
+`USE_COOKIES=true` only when a restricted video requires the cookie file.
+
+For temporary troubleshooting, set `DEBUG_ERRORS=true` to include the
+underlying downloader error in the API response. Turn it back off after
+diagnosis.
 
 ## Endpoints
+- `GET /` — developer portal
+- `GET /health` — health/status
+- `GET /search?query=...` — YouTube Music search
+- `GET /thumbnail?url=...` — thumbnail metadata
+- `GET /download?url=...` — JSON metadata for downloaded MP3
+- `GET /download?url=...&type=audio` — direct audio compatibility stream
+- `GET /stream?url=...` — direct MP3 response
+- `GET /video?url=...` — video download metadata
+- `GET /video-stream?url=...` — direct video response
+- `GET /files/{filename}` — cached file response
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /` | Developer portal |
-| `GET /health` | Public health check |
-| `GET /download?url=...` | Fast cache-first MP3 metadata response |
-| `POST /download` | Same endpoint for JSON bot clients |
-| `GET /download?url=...&live=true` | Progressive MP3 while downloading |
-| `GET /stream?url=...` | Fast cache-first direct MP3 response |
-| `GET /live?url=...` | Progressive MP3 while downloading |
-| `GET /video?url=...` | Video metadata response |
-| `GET /video-stream?url=...` | Direct MP4 response |
-| `GET /search?q=...&limit=...` | YouTube Music search |
-| `GET /thumbnail?url=...` | Video thumbnail metadata |
-| `GET /files/{filename}` | Serve a cached file |
-| `GET /docs` | OpenAPI / Swagger docs |
-
-`/download` accepts `url`, `video`, `link`, `video_url`, or `videoId`. If a bot
-sends a search phrase instead, it accepts `q`, `query`, `song`, or `search` and
-resolves the first YouTube Music result. Add `direct=true` when the bot expects
-the endpoint itself to return the complete MP3 bytes instead of JSON. Add
-`live=true` when playback should begin as soon as MP3 bytes are available,
-before the full song finishes downloading. Progressive mode is not cached;
-use the normal endpoint when the next request should be instant from cache.
-
-The JSON response keeps the canonical `download_url` field and also includes
-common compatibility aliases: `url`, `file_url`, `audio_url`, and
-`downloadUrl`, plus `stream_url`/`streamUrl` for progressive playback. Set
-`PUBLIC_BASE_URL` when running behind a proxy so these are absolute URLs
-reachable by Telegram bot servers.
-
-All endpoints except `/`, `/health`, and `/docs` require the configured
-`API_KEY`. Prefer `X-API-Key: your-key`; `Authorization: Bearer your-key` and
-the legacy `?api_key=your-key` form are also accepted.
-
-## Run locally
-
-1. Install FFmpeg.
-2. Create `.env` from `.env.example` and set a strong `API_KEY`.
-3. Install Python dependencies:
-
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. Start the API:
-
-   ```bash
-   ./start.sh
-   ```
-
-Then open `http://localhost:8000/`.
-
-## Example
-
-```bash
-curl -H "X-API-Key: change-this-to-a-long-random-key" \
-  "http://localhost:8000/download?url=https://youtu.be/VIDEO_ID"
-```
-
-Search-based compatibility request:
-
-```bash
-curl -H "X-API-Key: change-this-to-a-long-random-key" \
-  "http://localhost:8000/download?q=Never%20Gonna%20Give%20You%20Up"
-```
-
-JSON POST compatibility request:
-
-```bash
-curl -X POST -H "Content-Type: application/json" \
-  -H "X-API-Key: change-this-to-a-long-random-key" \
-  -d '{"url":"https://youtu.be/VIDEO_ID"}' \
-  "http://localhost:8000/download"
-```
-
-The first request downloads and converts the audio to MP3. Repeated requests
-for the same YouTube video reuse the local cache. `/stream` skips the JSON-to-
-file follow-up when a bot wants the audio bytes directly. The default audio
-quality is 192 kbps and can be changed with `AUDIO_QUALITY`; transfer speed
-still depends on the source, server, Telegram, and client networks.
+All protected endpoints require `X-API-Key`, `Authorization: Bearer ...`, or the legacy `api_key` query parameter.
 
 ## Docker
-
 ```bash
-docker build -t velocitybots .
-docker run --rm -p 8000:8000 --env-file .env velocitybots
+docker build -t magma-api .
+docker run -d --name magma-api -p 8000:8000 --env-file .env magma-api
 ```
 
-## Heroku
-
-Heroku deployment instructions, including FFmpeg setup, Docker Container Stack,
-config vars, and the optional private `COOKIE_URL`, are in
-`README_HEROKU.md`.
+The container installs FFmpeg and Node.js for yt-dlp's JavaScript challenge support.

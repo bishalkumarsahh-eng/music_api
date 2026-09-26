@@ -1,33 +1,49 @@
 {
-  "name": "VelocityBots API",
-  "description": "Fast, Telegram-compatible YouTube audio API with progressive playback.",
-  "keywords": [
-    "fastapi",
-    "telegram",
-    "music-bot",
-    "youtube",
-    "downloader"
-  ],
-  "env": {
-    "API_KEY": {
-      "description": "Private API key used by your Telegram music bot.",
-      "required": true
-    },
-    "PUBLIC_BASE_URL": {
-      "description": "Public Heroku URL, for example https://your-app.herokuapp.com",
-      "required": true
-    },
-    "COOKIE_URL": {
-      "description": "Optional private HTTPS URL returning a Netscape cookies.txt file.",
-      "required": false
-    }
-  },
+  "name": "Magma Music API",
+  "description": "FastAPI YouTube/YouTube Music API prepared for Heroku",
   "buildpacks": [
     {
-      "url": "https://github.com/heroku/heroku-buildpack-apt"
+      "url": "heroku/python"
     },
     {
-      "url": "heroku/python"
+      "url": "heroku/nodejs"
+    },
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
     }
-  ]
+  ],
+  "env": {
+    "COOKIE_URL": {
+      "description": "Public URL of the yt-dlp cookies.txt file",
+      "required": false,
+      "value": "https://raw.githubusercontent.com/themagmalord333-oss/COOKIE/main/cookies.txt"
+    },
+    "DOWNLOAD_DIR": {
+      "value": "downloads"
+    },
+    "CACHE_EXPIRE_HOURS": {
+      "value": "0"
+    },
+    "MAX_VIDEO_QUALITY": {
+      "value": "720"
+    },
+    "CONCURRENT_FRAGMENT_DOWNLOADS": {
+      "value": "15"
+    },
+    "HTTP_CHUNK_SIZE": {
+      "value": "10485760"
+    },
+    "SOCKET_TIMEOUT": {
+      "value": "15"
+    },
+    "RETRIES": {
+      "value": "3"
+    },
+    "FRAGMENT_RETRIES": {
+      "value": "3"
+    },
+    "YOUTUBE_PLAYER_CLIENTS": {
+      "value": "web_embedded,default"
+    }
+  }
 }
