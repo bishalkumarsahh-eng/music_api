@@ -6,6 +6,9 @@ import time
 import asyncio
 import sqlite3
 import logging
+
+POT_PROVIDER_BASE_URL = os.getenv('POT_PROVIDER_BASE_URL', 'http://127.0.0.1:4416')
+POT_FETCH_POLICY = os.getenv('YOUTUBE_FETCH_POT', 'always')
 import urllib.request
 import subprocess
 import base64
